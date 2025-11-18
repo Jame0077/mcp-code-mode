@@ -31,8 +31,8 @@ def main() -> None:
     interpreter = PythonInterpreter(
         enable_network_access=[],  # No outbound hosts allowed during Phase 0
         enable_env_vars=[],  # Disallow env propagation for the smoke test
-        enable_read_paths=["/tmp"],
-        enable_write_paths=["/tmp"],
+        enable_read_paths=[],
+        enable_write_paths=[],
     )
 
     snippet = 'print("Hello from DSpy sandbox!")'
