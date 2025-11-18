@@ -1,0 +1,1 @@
+{"mcpServers":{"code-executor":{"command":"/Users/themrb/Documents/personal/mcp-code-mode/docs/.venv/bin/python","args":["-m","mcp_code_mode.executor_server"],"description":"Local DSpy sandbox executor","alwaysAllow":["execute_code"]}}}
