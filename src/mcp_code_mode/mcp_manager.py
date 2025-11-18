@@ -176,13 +176,15 @@ class MCPServerManager:
     async def shutdown(self) -> None:
         """Close all open MCP sessions."""
 
-        await asyncio.gather(
-            *[
-                connection.close()
-                for connection in self.servers.values()
-            ],
-            return_exceptions=True,
-        )
+        # Connections were opened sequentially, so close them in LIFO order to
+        # unwind the nested async context managers correctly.
+        for connection in reversed(list(self.servers.values())):
+            try:
+                # Close sequentially so stdio_client.__aexit__ runs
+                # in the same task where __aenter__ was awaited.
+                await connection.close()
+            except Exception:
+                LOGGER.exception("Failed to close server %s", connection.name)
         self.servers.clear()
         self.all_dspy_tools = []
         self._initialized = False
