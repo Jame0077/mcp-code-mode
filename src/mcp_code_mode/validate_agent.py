@@ -1,0 +1,139 @@
+"""Tech validation script for CodeExecutionAgent.
+
+This script validates that the agent can:
+1. Accept a task and tool context.
+2. Generate code using DSpy.
+3. Use the provided tools in the generated code.
+"""
+import asyncio
+import logging
+import sys
+from typing import Any, Dict, List
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+LOGGER = logging.getLogger(__name__)
+
+try:
+    import dspy
+    from mcp_code_mode.agent import CodeExecutionAgent
+    from mcp_code_mode.tool_formatter import ToolSchemaFormatter
+except ImportError as e:
+    LOGGER.error("Failed to import dependencies: %s", e)
+    sys.exit(1)
+
+
+# Mock Tool for testing
+class MockTool:
+    def __init__(self, name: str, description: str, schema: Dict[str, Any]):
+        self.name = name
+        self.description = description
+        self.input_schema = schema
+
+    def __call__(self, **kwargs):
+        return f"Mock result for {self.name} with args: {kwargs}"
+
+
+async def validate_agent():
+    """Run validation steps for the CodeExecutionAgent."""
+    
+    # 1. Setup Mock Tools
+    LOGGER.info("Step 1: Setting up mock tools...")
+    read_file_tool = MockTool(
+        name="read_file",
+        description="Read the contents of a file",
+        schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to file"}
+            },
+            "required": ["path"],
+        },
+    )
+    
+    write_file_tool = MockTool(
+        name="write_file",
+        description="Write content to a file",
+        schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to file"},
+                "content": {"type": "string", "description": "Content to write"},
+            },
+            "required": ["path", "content"],
+        },
+    )
+    
+    tools = [read_file_tool, write_file_tool]
+    
+    # 2. Format Tools for LLM
+    LOGGER.info("Step 2: Formatting tools for LLM...")
+    formatter = ToolSchemaFormatter(tools)
+    tool_context = formatter.format_for_llm()
+    LOGGER.info("Tool Context Preview:\n%s", tool_context[:200] + "...")
+
+    # 3. Initialize Agent
+    LOGGER.info("Step 3: Initializing CodeExecutionAgent...")
+    # Configure DSpy with a dummy LM if needed, or assume environment is set up
+    # For this validation to work, we need a real LM or a mock LM.
+    # We'll try to use a real one if configured, otherwise we might need to mock dspy.
+    
+    # NOTE: In a real run, dspy.configure() must be called before this.
+    # We assume the user has their environment set up for DSpy (e.g. OPENAI_API_KEY).
+    # If not, this will fail, which is part of validation.
+    
+    try:
+        # Check if LM is configured
+        if not dspy.settings.lm:
+             LOGGER.warning("No DSpy LM configured. Attempting to configure default...")
+             # This might fail if no keys are present
+             try:
+                 lm = dspy.LM("openai/gpt-4o-mini")
+                 dspy.configure(lm=lm)
+             except Exception as e:
+                 LOGGER.error("Failed to configure default LM: %s", e)
+                 LOGGER.error("Please ensure OPENAI_API_KEY is set or configure DSpy manually.")
+                 return
+
+        agent = CodeExecutionAgent(
+            mcp_tools=tools,
+            tool_context=tool_context
+        )
+        
+    except Exception as e:
+        LOGGER.error("Failed to initialize agent: %s", e)
+        return
+
+    # 4. Run Agent with a Task
+    task = "Read the file at /tmp/test.txt and print its content."
+    LOGGER.info("Step 4: Running agent with task: '%s'", task)
+    
+    try:
+        result = await agent.run(task)
+        
+        LOGGER.info("Validation Result:")
+        LOGGER.info("  Success: %s", result["execution_result"]["success"])
+        LOGGER.info("  Generated Code:\n%s", result["generated_code"])
+        
+        # 5. Verify Output
+        if "read_file" in result["generated_code"]:
+            LOGGER.info("✅ PASS: Generated code uses 'read_file'")
+        else:
+            LOGGER.error("❌ FAIL: Generated code does NOT use 'read_file'")
+            
+        if result["execution_result"]["success"]:
+             LOGGER.info("✅ PASS: Execution simulation successful")
+        else:
+             LOGGER.error("❌ FAIL: Execution simulation failed")
+
+    except Exception as e:
+        LOGGER.error("Agent run failed: %s", e)
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    asyncio.run(validate_agent())

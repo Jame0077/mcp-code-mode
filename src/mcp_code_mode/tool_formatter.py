@@ -42,7 +42,13 @@ class ToolSchemaFormatter:
         """Create a markdown block describing one tool."""
 
         name = getattr(tool, "name", "unknown_tool")
-        description = getattr(tool, "description", "").strip() or "No description."
+        description = getattr(tool, "description", "")
+        
+        # Handle case where description is a method (e.g. in some dspy versions)
+        if callable(description):
+             description = description()
+             
+        description = description.strip() if isinstance(description, str) else "No description."
 
         schema = getattr(tool, "input_schema", None) or {}
         params = self._extract_properties(schema)
