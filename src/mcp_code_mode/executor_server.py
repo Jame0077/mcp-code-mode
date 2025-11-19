@@ -1,16 +1,86 @@
-"""FastMCP server that exposes the Phase 1 `execute_code` tool."""
+"""FastMCP server that exposes the Agentic Code Execution capabilities."""
 from __future__ import annotations
 
 import logging
-from typing import Any
+import os
+from contextlib import asynccontextmanager
+from typing import Any, Dict, AsyncIterator
 
+import dspy
 from fastmcp import Context, FastMCP
 
+from .agent import CodeExecutionAgent
 from .executor import ExecutionResult, SandboxOptions, SandboxedPythonExecutor
+from .mcp_integration import setup_mcp_tools
+from .mcp_manager import MCPServerManager
+from dotenv import load_dotenv
 
+load_dotenv()
 LOGGER = logging.getLogger(__name__)
 
-# Default sandbox forbids network/env/filesystem access for Phase 1.
+# --- Global State ---
+# We store the manager and tool context here so they persist across requests
+SERVER_STATE: Dict[str, Any] = {
+    "manager": None,
+    "mcp_tools": [],
+    "tool_context": "",
+}
+
+
+@asynccontextmanager
+async def server_lifespan(server: FastMCP) -> AsyncIterator[None]:
+    """Manage the lifecycle of the MCP server connections."""
+    LOGGER.info("Initializing Agent Server...")
+
+    # 1. Configure DSpy
+    # We default to gpt-4o-mini if available, or let dspy auto-configure if env vars are set
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    openai_key = os.environ.get("OPENAI_API_KEY")
+
+    if gemini_key:
+        # Use dspy.LM with gemini/ prefix which uses litellm under the hood
+        try:
+            # Note: dspy.Google is deprecated/removed in newer versions, use dspy.LM
+            lm = dspy.LM("gemini/gemini-2.5-pro", api_key=gemini_key)
+            dspy.configure(lm=lm)
+            print("✅ DSpy configured with Gemini (gemini/gemini-2.5-pro)")
+        except Exception as e:
+            print(f"❌ Failed to configure Gemini: {e}")
+            return
+    elif openai_key:
+        lm = dspy.LM("openai/gpt-4o-mini", api_key=openai_key)
+        dspy.configure(lm=lm)
+        print("✅ DSpy configured with OpenAI (gpt-4o-mini)")
+    else:
+        print("❌ No API key found. Please set GEMINI_API_KEY or OPENAI_API_KEY.")
+        return
+
+    # 2. Connect to upstream MCP servers
+    manager = MCPServerManager()
+    try:
+        # This discovers tools from mcp_servers.json
+        setup = await setup_mcp_tools(manager)
+        
+        SERVER_STATE["manager"] = setup["manager"]
+        SERVER_STATE["mcp_tools"] = setup["tools"]
+        SERVER_STATE["tool_context"] = setup["llm_context"]
+        
+        LOGGER.info(f"Discovered {len(SERVER_STATE['mcp_tools'])} tools")
+        
+        yield
+        
+    finally:
+        LOGGER.info("Shutting down Agent Server...")
+        await manager.shutdown()
+        SERVER_STATE.clear()
+
+
+# Initialize FastMCP with lifespan
+mcp = FastMCP("Code Executor Agent", lifespan=server_lifespan)
+
+# --- Phase 1: Dumb Executor (Kept for reference/direct use) ---
+
+# Default sandbox for direct execution (safe defaults)
 EXECUTOR = SandboxedPythonExecutor(
     options=SandboxOptions(
         enable_network_access=False,
@@ -21,9 +91,7 @@ EXECUTOR = SandboxedPythonExecutor(
     )
 )
 
-mcp = FastMCP("Code Executor Server")
 DEFAULT_TIMEOUT = 30
-
 
 @mcp.tool()
 async def execute_code(
@@ -31,7 +99,11 @@ async def execute_code(
     timeout: int = DEFAULT_TIMEOUT,
     ctx: Context | None = None,
 ) -> ExecutionResult:
-    """Execute Python code inside DSpy's sandboxed interpreter."""
+    """Execute Python code inside DSpy's sandboxed interpreter.
+    
+    This is a low-level tool that runs exactly what you give it.
+    For agentic problem solving, use 'run_agent' instead.
+    """
 
     try:
         numeric_timeout = _coerce_timeout(timeout)
@@ -60,9 +132,92 @@ async def execute_code(
     return result
 
 
+# --- Phase 4: The Agent ---
+
+@mcp.tool()
+async def run_agent(
+    task: str,
+    timeout: int = 120,
+    ctx: Context | None = None,
+) -> str:
+    """
+    Run an autonomous coding agent to solve a task.
+    
+    The agent can:
+    1. Access upstream MCP tools (filesystem, memory, etc.)
+    2. Write and execute Python code to solve the problem
+    3. iterate if errors occur
+    
+    Args:
+        task: The natural language task description (e.g., "Read /tmp/data.txt and summarize it")
+    """
+    if not SERVER_STATE.get("mcp_tools"):
+        return "Error: No tools available. Is the server initialized?"
+
+    if ctx:
+        await ctx.info(f"Agent received task: {task}")
+        await ctx.report_progress(0, 100)
+
+    try:
+        # Initialize the agent with the discovered tools and formatted context
+        agent = CodeExecutionAgent(
+            mcp_tools=SERVER_STATE["mcp_tools"],
+            tool_context=SERVER_STATE["tool_context"],
+        )
+
+        # Run the agent
+        if ctx:
+            await ctx.info("Agent is reasoning and generating code...")
+        
+        result = await agent.run(task, timeout=timeout)
+        
+        execution_result = result["execution_result"]
+        generated_code = result["generated_code"]
+        
+        success = execution_result.get("success", False)
+        stdout = execution_result.get("stdout", "")
+        stderr = execution_result.get("stderr", "")
+
+        # Format the output for the user
+        status_icon = "✅" if success else "❌"
+        response = [
+            f"{status_icon} **Task Complete**" if success else f"{status_icon} **Task Failed**",
+            "",
+            "### Execution Output",
+            "```",
+            stdout if stdout else "(No output)",
+            "```",
+        ]
+        
+        if stderr:
+            response.extend([
+                "",
+                "### Errors",
+                "```",
+                stderr,
+                "```"
+            ])
+            
+        response.extend([
+            "",
+            "### Generated Code",
+            "```python",
+            generated_code,
+            "```"
+        ])
+
+        if ctx:
+            await ctx.report_progress(100, 100)
+
+        return "\n".join(response)
+
+    except Exception as e:
+        LOGGER.exception("Agent failed")
+        return f"Agent encountered a critical error: {str(e)}"
+
+
 def _coerce_timeout(raw: Any) -> float:
     """Convert timeout values from MCP clients into a float."""
-
     try:
         timeout = float(raw)
     except (TypeError, ValueError) as exc:
@@ -75,9 +230,9 @@ def _coerce_timeout(raw: Any) -> float:
 
 def main() -> None:
     """CLI entry point for running the executor server."""
-
     logging.basicConfig(level=logging.INFO)
-    LOGGER.info("Starting Code Executor Server (Phase 1)")
+    LOGGER.info("Starting Code Executor Agent Server")
+    # FastMCP 2.0+ handles lifespan automatically when run() is called
     mcp.run(transport="stdio")
 
 

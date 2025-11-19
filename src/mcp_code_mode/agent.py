@@ -1,13 +1,20 @@
 """DSpy agent for generating and executing code using MCP tools."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import json
 from typing import Any, Dict, List, Optional, Sequence
 
 try:
     import dspy
 except ImportError:
     dspy = None  # type: ignore
+
+try:
+    from aiohttp import web
+except ImportError:
+    web = None
 
 LOGGER = logging.getLogger(__name__)
 
@@ -22,6 +29,69 @@ class CodeGenerationSignature(dspy.Signature):
     code: dspy.Code = dspy.OutputField(
         desc="Python code that uses the available tools to complete the task"
     )
+
+
+class _ToolBridge:
+    """Temporary HTTP server to bridge sandbox calls to MCP tools."""
+
+    def __init__(self, tools_map: Dict[str, Any]) -> None:
+        self.tools_map = tools_map
+        self.runner: Optional[web.AppRunner] = None
+        self.site: Optional[web.TCPSite] = None
+        self.port: Optional[int] = None
+
+    async def handle_request(self, request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+            name = data.get("name")
+            kwargs = data.get("args", {})
+
+            if name not in self.tools_map:
+                return web.json_response(
+                    {"error": f"Tool {name} not found"}, status=404
+                )
+
+            tool = self.tools_map[name]
+            # Handle both sync and async tool wrappers
+            # dspy.Tool wrappers might be callable directly
+            result = tool(**kwargs)
+            if asyncio.iscoroutine(result):
+                result = await result
+
+            return web.json_response({"result": result})
+        except Exception as e:
+            LOGGER.exception(f"Tool bridge error for {name}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def start(self) -> str:
+        if web is None:
+            raise RuntimeError("aiohttp is required for tool bridge")
+
+        app = web.Application()
+        app.router.add_post("/tool", self.handle_request)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, "localhost", 0)
+        await self.site.start()
+        
+        # Get the assigned port
+        # Accessing socket directly to get the ephemeral port
+        if self.site is None:
+            raise RuntimeError("Server site not initialized")
+        server = self.site._server
+        if server is None:
+            raise RuntimeError("Server not started")
+        
+        # aiohttp internal API access
+        socket = server.sockets[0] # type: ignore
+        self.port = socket.getsockname()[1]
+        return f"http://localhost:{self.port}/tool"
+
+    async def stop(self) -> None:
+        if self.site:
+            await self.site.stop()
+        if self.runner:
+            await self.runner.cleanup()
 
 
 class CodeExecutionAgent:
@@ -45,20 +115,22 @@ class CodeExecutionAgent:
 
         self.mcp_tools = list(mcp_tools)
         self.tool_context = tool_context
+        # Create a map for easier lookup by name
         self.tool_names = [getattr(t, "name", str(t)) for t in self.mcp_tools]
+        self.tools_map = {name: tool for name, tool in zip(self.tool_names, self.mcp_tools)}
 
         # Create code generator with tool-aware signature
-        # We use ProgramOfThought to allow for reasoning before code generation
         self.generator = dspy.ProgramOfThought(
             CodeGenerationSignature,
             max_iters=max_iters,
         )
 
-    async def run(self, task: str) -> Dict[str, Any]:
+    async def run(self, task: str, timeout: int = 120) -> Dict[str, Any]:
         """Generate and execute code for a task.
 
         Args:
             task: The user's natural language request.
+            timeout: Execution timeout in seconds.
 
         Returns:
             A dictionary containing the task, generated code, and execution result.
@@ -66,9 +138,7 @@ class CodeExecutionAgent:
         LOGGER.info("Running agent for task: %s", task)
         LOGGER.debug("Available tools: %s", self.tool_names)
 
-        # Generate code - tool_context tells LLM what tools exist
-        # ProgramOfThought.acall returns a Prediction object
-        # Note: dspy.ProgramOfThought might not support async acall in all versions, so we use sync call
+        # Generate code
         result = self.generator(
             task=task,
             available_tools=self.tool_context,
@@ -78,7 +148,7 @@ class CodeExecutionAgent:
         LOGGER.info("Generated code:\n%s", generated_code)
 
         # Execute code with access to MCP tools
-        execution_result = await self._execute_with_tools(generated_code)
+        execution_result = await self._execute_with_tools(generated_code, timeout=timeout)
 
         return {
             "task": task,
@@ -86,62 +156,51 @@ class CodeExecutionAgent:
             "execution_result": execution_result,
         }
 
-    def _generate_tool_shims(self) -> str:
-        """Generate Python shims for MCP tools to be injected into the sandbox.
+    def _generate_tool_shims(self, bridge_url: str) -> str:
+        """Generate Python shims that call back to the host via HTTP.
 
-        Since the sandbox is isolated, we need to provide implementations for the
-        tools that the agent expects to be available.
-        
-        For Phase 3, we implement shims for common filesystem operations that
-        map to standard Python file I/O, which Pyodide/Deno supports (within
-        allowed paths).
+        This generates a set of functions that match the discovered tools,
+        but implemented as HTTP calls to the ephemeral bridge server.
         """
-        shims = []
-        
-        # Helper for read_file
-        if "read_file" in self.tool_names:
-            shims.append('''
-def read_file(path):
-    """Read the contents of a file."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception as e:
-        return f"Error reading file: {e}"
-''')
+        shims = [
+            "import urllib.request",
+            "import json",
+            "import os",
+            "",
+            f'BRIDGE_URL = "{bridge_url}"',
+            "",
+            "def _call_tool(name, args):",
+            "    '''Internal helper to call MCP tools via bridge.'''",
+            "    try:",
+            "        data = json.dumps({'name': name, 'args': args}).encode('utf-8')",
+            "        req = urllib.request.Request(",
+            "            BRIDGE_URL, ",
+            "            data=data, ",
+            "            headers={'Content-Type': 'application/json'}",
+            "        )",
+            "        with urllib.request.urlopen(req) as response:",
+            "            if response.status >= 400:",
+            "                return f'Error calling tool {name}: {response.status} {response.reason}'",
+            "            result_data = json.loads(response.read().decode('utf-8'))",
+            "            if 'error' in result_data:",
+            "                return f'Error: {result_data[\"error\"]}'",
+            "            return result_data['result']",
+            "    except Exception as e:",
+            "        return f'Error invoking tool {name}: {e}'",
+            ""
+        ]
 
-        # Helper for write_file
-        if "write_file" in self.tool_names:
-            shims.append('''
-def write_file(path, content):
-    """Write content to a file."""
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return f"Successfully wrote to {path}"
-    except Exception as e:
-        return f"Error writing file: {e}"
-''')
-
-        # Helper for list_directory (optional but good to have)
-        if "list_directory" in self.tool_names:
-            shims.append('''
-import os
-def list_directory(path):
-    """List files in a directory."""
-    try:
-        return os.listdir(path)
-    except Exception as e:
-        return f"Error listing directory: {e}"
-''')
+        # Generate a shim function for each available tool
+        for tool_name in self.tool_names:
+            shims.append(f"def {tool_name}(**kwargs):")
+            shims.append(f'    """Call the {tool_name} tool."""')
+            shims.append(f'    return _call_tool("{tool_name}", kwargs)')
+            shims.append("")
 
         return "\n".join(shims)
 
-    async def _execute_with_tools(self, code: str) -> Dict[str, Any]:
-        """Execute generated code with MCP tools available.
-
-        This uses the Phase 1 SandboxedPythonExecutor to run the code.
-        """
+    async def _execute_with_tools(self, code: str, timeout: int = 120) -> Dict[str, Any]:
+        """Execute generated code with MCP tools available."""
         # Validate code first
         is_valid, message = self.validate_code(code)
         if not is_valid:
@@ -152,50 +211,53 @@ def list_directory(path):
                 "duration_ms": 0,
             }
 
-        # Initialize executor with default options for now
         from .executor import SandboxedPythonExecutor, SandboxOptions
 
-        # Inject tool shims
-        tool_header = self._generate_tool_shims()
-        full_code = f"{tool_header}\n\n# Generated Code\n{code}"
-
-        options = SandboxOptions(
-            enable_network_access=True,  # Enable network for fetch tools
-            enable_env_vars=True,       # Enable env vars if needed
-            # We might need to mount paths for filesystem tools
-            enable_read_paths=["/tmp"],
-            enable_write_paths=["/tmp"],
-        )
-        executor = SandboxedPythonExecutor(options=options)
-
-        # Execute
+        # Start the tool bridge
+        bridge = _ToolBridge(self.tools_map)
+        bridge_url = ""
         try:
-            result = await executor.run(full_code)
+            bridge_url = await bridge.start()
+            LOGGER.info(f"Tool bridge started at {bridge_url}")
+
+            # Inject tool shims pointing to the bridge
+            tool_header = self._generate_tool_shims(bridge_url)
+            full_code = f"{tool_header}\n\n# Generated Code\n{code}"
+
+            options = SandboxOptions(
+                enable_network_access=True,  # Required for bridge
+                enable_env_vars=True,
+                # Mount /tmp for file tools if they still want local access
+                enable_read_paths=["/tmp"],
+                enable_write_paths=["/tmp"],
+            )
+            executor = SandboxedPythonExecutor(options=options)
+
+            # Execute
+            result = await executor.run(full_code, timeout=timeout)
             return result
+            
         except Exception as e:
+            LOGGER.exception("Execution failed")
             return {
                 "success": False,
                 "stdout": "",
                 "stderr": f"Execution error: {str(e)}",
                 "duration_ms": 0,
             }
+        finally:
+            await bridge.stop()
 
     def validate_code(self, code: str) -> tuple[bool, str]:
         """Validate generated code before execution."""
         # Check if code uses any available tools
-        # This is a heuristic; a proper parser would be better but this suffices for now.
         uses_tools = any(name in code for name in self.tool_names)
-
-        # Check if code prints result (common requirement for PoT/CodeAct to see output)
         has_output = "print" in code
 
         if not uses_tools:
-            # It's possible the task doesn't need tools, but for this agent's purpose,
-            # we generally expect tool usage. We'll warn but maybe not fail strictly
-            # if the prompt was just "calculate 1+1".
-            # For the strict requirement of "using MCP tools", we'll enforce it.
-            return False, "Code does not use any available MCP tools"
-
+            # We allow execution even without tools, but warn
+            pass
+            
         if not has_output:
             return False, "Code does not print any output"
 
