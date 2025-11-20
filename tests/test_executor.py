@@ -72,7 +72,8 @@ async def test_executor_exception_result() -> None:
 @pytest.mark.asyncio
 async def test_execute_code_invalid_timeout(monkeypatch) -> None:
     # No executor patch needed; timeout validation happens before execution.
-    result = await executor_server.execute_code("print('x')", timeout=0)
+    # We call the underlying function (.fn) because the tool wrapper is not directly callable
+    result = await executor_server.execute_code.fn("print('x')", timeout=0)
 
     assert result["success"] is False
     assert result["diagnostics"]["error_type"] == "INVALID_ARGUMENT"
@@ -97,7 +98,8 @@ async def test_execute_code_success(monkeypatch) -> None:
     fake_executor = RecordingExecutor()
     monkeypatch.setattr(executor_server, "EXECUTOR", fake_executor)
 
-    result = await executor_server.execute_code("print('ok')", timeout=5)
+    # Call the underlying function
+    result = await executor_server.execute_code.fn("print('ok')", timeout=5)
 
     assert result["success"] is True
     assert fake_executor.calls == [("print('ok')", 5.0)]

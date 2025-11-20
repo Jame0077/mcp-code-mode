@@ -27,7 +27,7 @@ class CodeGenerationSignature(dspy.Signature):
         desc="Detailed documentation of available MCP tools with parameters and examples"
     )
     code: dspy.Code = dspy.OutputField(
-        desc="Python code that uses the available tools to complete the task"
+        desc="Python code that uses the available tools to complete the task. The code MUST print the final answer/result to stdout."
     )
 
 
@@ -125,12 +125,13 @@ class CodeExecutionAgent:
             max_iters=max_iters,
         )
 
-    async def run(self, task: str, timeout: int = 120) -> Dict[str, Any]:
+    async def run(self, task: str, timeout: int = 120, ctx: Any = None) -> Dict[str, Any]:
         """Generate and execute code for a task.
 
         Args:
             task: The user's natural language request.
             timeout: Execution timeout in seconds.
+            ctx: Optional FastMCP Context for progress reporting.
 
         Returns:
             A dictionary containing the task, generated code, and execution result.
@@ -139,12 +140,66 @@ class CodeExecutionAgent:
         LOGGER.debug("Available tools: %s", self.tool_names)
 
         # Generate code
-        result = self.generator(
-            task=task,
-            available_tools=self.tool_context,
-        )
+        # Run the synchronous dspy generator in a separate thread to avoid blocking the event loop
+        # We also capture stdout to prevent dspy from printing to the real stdout (which would break MCP)
+        import io
+        import contextlib
+        import time
+        
+        def _run_generator_safely():
+            f = io.StringIO()
+            with contextlib.redirect_stdout(f):
+                start = time.time()
+                try:
+                    # Ensure dspy doesn't try to use the main thread loop if it does any async stuff internally
+                    # (Though ProgramOfThought is mostly sync in current dspy versions)
+                    res = self.generator(
+                        task=task,
+                        available_tools=self.tool_context,
+                    )
+                    return res, f.getvalue(), time.time() - start
+                except Exception:
+                    # If it fails, we still want the stdout
+                    raise
 
-        generated_code = result.code
+        # Start a progress ticker to keep the client connection alive and informed
+        stop_ticker = asyncio.Event()
+        
+        async def progress_ticker():
+            seconds = 0
+            while not stop_ticker.is_set():
+                await asyncio.sleep(1)
+                seconds += 1
+                if ctx:
+                    try:
+                         await ctx.info(f"Agent thinking... ({seconds}s)")
+                         # Toggle progress to show activity
+                         await ctx.report_progress(seconds % 10, 10)
+                    except Exception:
+                         # Ignore errors if ctx is closed
+                         pass
+                
+                if seconds % 2 == 0:
+                     LOGGER.info(f"Agent generation still in progress... ({seconds}s)")
+
+        ticker_task = asyncio.create_task(progress_ticker())
+
+        try:
+            result, captured_stdout, duration = await asyncio.to_thread(_run_generator_safely)
+            LOGGER.info("DSpy generation took %.2f seconds", duration)
+            if captured_stdout:
+                LOGGER.warning("DSpy wrote to stdout (captured): %s", captured_stdout)
+        except Exception as e:
+            LOGGER.exception("DSpy generation failed")
+            raise e
+        finally:
+            stop_ticker.set()
+            try:
+                await ticker_task
+            except Exception:
+                pass
+
+        generated_code = str(result.code)
         LOGGER.info("Generated code:\n%s", generated_code)
 
         # Execute code with access to MCP tools
@@ -228,8 +283,10 @@ class CodeExecutionAgent:
                 enable_network_access=True,  # Required for bridge
                 enable_env_vars=True,
                 # Mount /tmp for file tools if they still want local access
-                enable_read_paths=["/tmp"],
-                enable_write_paths=["/tmp"],
+                # Note: We cannot mount directories in dspy, so we leave this empty.
+                # The sandbox has its own ephemeral /tmp.
+                enable_read_paths=[],
+                enable_write_paths=[],
             )
             executor = SandboxedPythonExecutor(options=options)
 

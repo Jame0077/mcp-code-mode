@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 from typing import Any, Dict, AsyncIterator
 
@@ -37,22 +38,23 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[None]:
     gemini_key = os.environ.get("GEMINI_API_KEY")
     openai_key = os.environ.get("OPENAI_API_KEY")
 
-    if gemini_key:
+    # Prefer OpenAI for speed/reliability if available, then Gemini
+    if openai_key:
+        lm = dspy.LM("openai/gpt-4o-mini", api_key=openai_key)
+        dspy.configure(lm=lm)
+        print("✅ DSpy configured with OpenAI (gpt-4o-mini)", file=sys.stderr)
+    elif gemini_key:
         # Use dspy.LM with gemini/ prefix which uses litellm under the hood
         try:
             # Note: dspy.Google is deprecated/removed in newer versions, use dspy.LM
             lm = dspy.LM("gemini/gemini-2.5-pro", api_key=gemini_key)
             dspy.configure(lm=lm)
-            print("✅ DSpy configured with Gemini (gemini/gemini-2.5-pro)")
+            print("✅ DSpy configured with Gemini (gemini/gemini-2.5-pro)", file=sys.stderr)
         except Exception as e:
-            print(f"❌ Failed to configure Gemini: {e}")
+            print(f"❌ Failed to configure Gemini: {e}", file=sys.stderr)
             return
-    elif openai_key:
-        lm = dspy.LM("openai/gpt-4o-mini", api_key=openai_key)
-        dspy.configure(lm=lm)
-        print("✅ DSpy configured with OpenAI (gpt-4o-mini)")
     else:
-        print("❌ No API key found. Please set GEMINI_API_KEY or OPENAI_API_KEY.")
+        print("❌ No API key found. Please set GEMINI_API_KEY or OPENAI_API_KEY.", file=sys.stderr)
         return
 
     # 2. Connect to upstream MCP servers
@@ -169,7 +171,7 @@ async def run_agent(
         if ctx:
             await ctx.info("Agent is reasoning and generating code...")
         
-        result = await agent.run(task, timeout=timeout)
+        result = await agent.run(task, timeout=timeout, ctx=ctx)
         
         execution_result = result["execution_result"]
         generated_code = result["generated_code"]

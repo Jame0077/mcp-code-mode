@@ -37,7 +37,7 @@ class ExecutionResult(TypedDict, total=False):
     diagnostics: Optional[Dict[str, Any]]
 
 
-@dataclass(slots=True)
+@dataclass
 class SandboxOptions:
     """Configuration passed to DSpy's PythonInterpreter."""
 
@@ -49,13 +49,25 @@ class SandboxOptions:
 
     def to_interpreter_kwargs(self) -> Dict[str, Any]:
         """Translate the dataclass to PythonInterpreter keyword arguments."""
+        import os
 
         def _coerce_paths(value: Sequence[str]) -> list[str]:
             return list(value) if value else []
 
+        enable_network_access = self.enable_network_access
+        if enable_network_access is True:
+            # dspy does not support True for allow-all, so we default to localhost
+            # which is required for the tool bridge.
+            enable_network_access = ["localhost", "127.0.0.1"]
+        
+        enable_env_vars = self.enable_env_vars
+        if enable_env_vars is True:
+            # dspy does not support True for allow-all, so we list all current env vars
+            enable_env_vars = list(os.environ.keys())
+
         return {
-            "enable_network_access": self.enable_network_access,
-            "enable_env_vars": self.enable_env_vars,
+            "enable_network_access": enable_network_access,
+            "enable_env_vars": enable_env_vars,
             "enable_read_paths": _coerce_paths(self.enable_read_paths),
             "enable_write_paths": _coerce_paths(self.enable_write_paths),
         }
