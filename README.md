@@ -1,100 +1,167 @@
 # MCP Code Mode
 
-Prototype implementation for the Code Execution MCP Server with DSpy. This repo follows the implementation plan in `docs/implementation-plan.md`.
+Prototype implementation for the Code Execution MCP Server with DSpy. The "Code Execution with MCP" architecture combines the strengths of Large Language Models at code generation with the Model Context Protocol for tool integration. This system enables an AI agent to write Python code that runs in an isolated sandbox while seamlessly calling external MCP tools.
 
-## Toolchain Requirements
-
-- Python 3.11 (3.11.0 or newer, <3.13 recommended)
-- Node.js 20+ with `npx` available (needed for the reference MCP servers)
-- `pip` for installing the Python dependencies listed in `pyproject.toml` / `requirements*.txt`
+## Project Status
+✅ **Phase 0-2 Completed**: Core executor, tool discovery, and formatting are implemented.
+🚧 **Phase 3 Active**: Building the DSpy Code Generation Agent.
+See [**Roadmap**](docs/ROADMAP.md) for details.
 
 ## Quick Start
 
+### 1. Installation
+Requires Python 3.11+ and Node.js 20+.
+
 ```bash
+# Create virtual environment
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-dev.txt
-pip install -e .
 
-# Copy secrets template and fill it in locally (never commit real keys)
-cp .env.example .env
-```
+# Install dependencies
+pip install -e .[dev]
 
-After installing dependencies and adding your API keys to `.env`, sanity-check the
-DSpy sandbox before running the server:
-
-```bash
-python scripts/test_dspy_sandbox.py
-```
-
-### Sandbox guardrails
-
-All snippets (including agent-generated code) pass through policy checks before
-hitting the DSpy sandbox. These guardrails currently enforce:
-
-- ✅ Character/line limits (8k chars / 400 lines) to prevent runaway payloads
-- ✅ Import allowlist (`json`, `math`, `re`, `datetime`, etc.)
-- ✅ Disallowed token scan (e.g., `subprocess`, `socket`, `open(`, `eval`, `exec`,
-  `while True`)
-
-Violations return a structured `POLICY_VIOLATION` with a human-readable reason so
-MCP clients can surface clear diagnostics to the end user.
-
-To keep the Node-based MCP servers current, run:
-
-```bash
+# Install Node.js dependencies for reference servers
 npm install -g npm@latest
 ```
 
-The `mcp_servers.json` file enumerates the default MCP servers (filesystem, memory, fetch). Update this file to point at any additional servers you want available during experimentation.
+### 2. Configuration
+Copy the example environment file and configure secrets:
+```bash
+cp .env.example .env
+```
 
-## Phase 1 Executor Server
+Configure your MCP servers in `mcp_servers.json`:
+```json
+{
+  "servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/your-working-folder"],
+      "description": "Local file system operations"
+    }
+  }
+}
+```
 
-The Phase 1 milestone introduces a minimal FastMCP server that exposes a single `execute_code` tool backed by DSpy's sandboxed Python interpreter.
+### 3. Running the Server
+Launch the Code Execution MCP server:
+```bash
+python -m mcp_code_mode.executor_server
+```
 
-1. Activate your virtual environment.
-2. Launch the server with:
-   ```bash
-   python -m mcp_code_mode.executor_server
-   ```
-3. Point an MCP-compatible client at the process (stdio transport) and call the `execute_code` tool with arbitrary Python snippets.
+## Development Commands
 
-Every invocation returns a structured payload:
+| Command | Description |
+|---------|-------------|
+| `pytest` | Run all tests |
+| `ruff check .` | Lint the codebase |
+| `black .` | Format the codebase |
+| `mypy src` | Type check the source |
+| `python scripts/test_dspy_sandbox.py` | Sanity check the sandbox |
 
-| Field | Description |
-|-------|-------------|
-| `success` | `True` if the snippet finished without exceptions or timeouts. |
-| `stdout` / `stderr` | Captured output streams (truncated to 64 kB). |
-| `duration_ms` | Total runtime in milliseconds. |
-| `diagnostics` | Optional metadata describing errors/timeouts. |
+## Sandbox Guardrails
 
-Timeouts and invalid arguments are reported cleanly, and failures are echoed through the FastMCP context log for easier debugging.
+The system enforces policies before code execution:
+- **Limits**: 8k characters / 400 lines max.
+- **Imports**: Allowlist only (`json`, `math`, `re`, `datetime`, etc.).
+- **Tokens**: Disallows potentially dangerous tokens (`subprocess`, `exec`, `eval`).
 
-## Testing Status
+Violations return a `POLICY_VIOLATION` error.
 
-The Phase 1 executor server has been tested with the following scenarios:
+## Architecture
 
-### ✅ Completed Tests
+### Overview
 
-1. **Basic Execution**: Successfully executes simple Python snippets with correct stdout capture
-   - Test: `print('hello from sandbox')`
-   - Result: `{"success":true,"stdout":"hello from sandbox\n","stderr":"","duration_ms":1978,"diagnostics":null}`
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   MCP Client (Claude, etc.)                  │
+└────────────────────────┬────────────────────────────────────┘
+                         │ MCP Protocol (stdio/HTTP/SSE)
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    FastMCP Server                            │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  @mcp.tool                                           │  │
+│  │  async def execute_code(code: str):                 │  │
+│  │      # 1. Execute in DSpy sandbox                   │  │
+│  │      result = await sandbox.run(code)               │  │
+│  │      return result                                   │  │
+│  └──────────────────────────────────────────────────────┘  │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+                         ▼
+          ┌──────────────────────────────┐
+          │    Sandbox Engine:           │
+          │  • DSpy PythonInterpreter   │
+          │    (Deno + Pyodide)         │
+          └──────────────────────────────┘
+```
 
-2. **Error Handling**: Properly captures and reports Python exceptions with diagnostic information
-   - Test: `raise ValueError("boom")`
-   - Result: `{"success":false,"stdout":"","stderr":"ValueError: ['boom']","duration_ms":20,"diagnostics":{"error_type":"InterpreterError","traceback":"..."}}`
+### Why Code Mode?
 
-3. **Timeout Detection**: Correctly detects and reports execution timeouts
-   - Test: `while True: pass` (2s timeout)
-   - Result: `{"success":false,"stdout":"","stderr":"Execution timed out after 2.00s","duration_ms":2001,"diagnostics":{"error_type":"TIMEOUT","timeout_seconds":2.0}}`
+Traditional MCP implementations face critical challenges:
+1. **Context Window Bloat**: Every tool definition consumes tokens, limiting scalability.
+2. **Token Cost**: Multiple back-and-forth tool calls are expensive.
+3. **Latency**: Sequential tool invocations create cumulative delays.
+4. **Composability**: Complex workflows require many discrete steps.
 
-### ⚠️ Known Issues
+Code Mode addresses these by leveraging what LLMs excel at: writing code. Rather than making multiple tool calls, the agent writes a Python script that orchestrates all necessary operations internally.
 
-1. **Interpreter State Management**: After a timeout occurs, the interpreter instance enters a bad state where all subsequent executions immediately timeout. This requires disconnecting and reconnecting to the MCP server to obtain a fresh interpreter instance.
+### Core Components
 
-### 🔄 Next Steps
+1. **The Executor Server (FastMCP)** (`src/mcp_code_mode/executor_server.py`)
+   The server exposes an `execute_code` tool backed by DSpy's sandboxed Python interpreter. Uses `fastmcp` to handle the MCP protocol and `dspy` for execution.
 
-1. Fix interpreter state management after timeouts
-2. Implement proper interpreter recycling/recreation
-3. Add tool formatter + integration utilities for Phase 2
-4. Enable generated code to discover/use remote MCP tools
+2. **Configuration-Driven Discovery** (`mcp_servers.json`)
+   The system uses `mcp_servers.json` to explicitly configure which MCP servers to connect to. Loaded by `src/mcp_code_mode/mcp_manager.py`.
+
+3. **Tool Schema Formatting** (`src/mcp_code_mode/tool_formatter.py`)
+   Formats discovered MCP tools into readable documentation that gets passed to the code generation LLM, so it knows what tools exist.
+
+4. **Context Injection**
+   The formatted tool schemas are passed as an input field to the LLM. The LLM knows tool names, parameters, and usage examples *before* it writes the code.
+
+### Information Flow
+
+```
+1. mcp_servers.json (Defines servers)
+   ↓
+2. MCPServerManager.initialize()
+   ├─ Connect to configured servers
+   ├─ Call list_tools() on each
+   └─ Convert to DSpy tools
+   ↓
+3. ToolSchemaFormatter.format_for_llm()
+   └─ Creates readable documentation
+   ↓
+4. CodeExecutionAgent
+   └─ Stores both callable tools and schemas
+   ↓
+5. Agent Generation
+   └─ Passes tool_context to LLM
+   ↓
+6. Code Execution
+   └─ Code runs in sandbox, calling actual tools via MCP
+```
+
+### Design Evolution
+
+| Component | Original Research | Current Implementation | Reason |
+|-----------|-------------------|------------------------|--------|
+| **Sandbox** | Docker containers | DSpy PythonInterpreter | Simpler, lighter, WebAssembly-based |
+| **Bridge** | Flask/HTTP RPC | Direct MCP Connection | No custom server needed |
+| **Discovery**| Unclear | `mcp_servers.json` | Explicit configuration |
+| **Tools** | Auto-generated `mcp_tools.py` | `dspy.Tool.from_mcp_tool` | Native DSpy integration |
+
+### Troubleshooting
+
+**Timeout Issues**:
+If the interpreter times out, it may enter a bad state. Currently, the best fix is to restart the server or reconnect the client to get a fresh interpreter instance.
+
+**Missing Tools**:
+Ensure `mcp_servers.json` paths are correct and that you have run `npm install` if using Node-based servers.
+
+## References
+- [DSpy Documentation](https://dspy.ai)
+- [Model Context Protocol](https://modelcontextprotocol.io)
+- [FastMCP](https://github.com/jlowin/fastmcp)

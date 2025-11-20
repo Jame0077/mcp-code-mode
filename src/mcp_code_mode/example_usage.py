@@ -19,7 +19,9 @@ try:
     import dspy
     from dotenv import load_dotenv
     from mcp_code_mode.agent import CodeExecutionAgent
+    from mcp_code_mode.executor import LocalPythonExecutor
     from mcp_code_mode.mcp_integration import setup_mcp_tools
+    from mcp_code_mode.tool_bridge import MCPToolBridge
 except ImportError as e:
     print(f"Error importing dependencies: {e}")
     print("Please ensure you have installed the requirements (including python-dotenv).")
@@ -74,37 +76,49 @@ async def main():
     
     print(f"Using config: {config_path}")
 
+    from mcp_code_mode.mcp_manager import MCPServerManager
+
+    manager = MCPServerManager(config_path=config_path)
+    bridge = None
+
     try:
-        # Pass the config path to setup_mcp_tools
-        # We need to update setup_mcp_tools to accept a config path or manager with path
-        from mcp_code_mode.mcp_manager import MCPServerManager
-        manager = MCPServerManager(config_path=config_path)
         mcp_setup = await setup_mcp_tools(manager=manager)
     except Exception as e:
         print(f"❌ Failed to discover tools: {e}")
         print(f"Make sure `{config_path}` exists and servers are installed.")
+        await manager.shutdown()
         return
 
     tools = mcp_setup["tools"]
     tool_context = mcp_setup["llm_context"]
     print(f"✅ Discovered {len(tools)} tools")
-    
-    # 3. Initialize Agent
+
+    # 3. Initialize the sandbox + bridge used by the agent
+    executor = LocalPythonExecutor()
+    bridge = MCPToolBridge(tools)
+    await bridge.start()
+
+    async def sandbox_runner(code, timeout=30, ctx=None, variables=None):
+        return await executor.run(code, timeout=timeout, variables=variables)
+
+    # 4. Initialize Agent
     print("\n🤖 Initializing CodeExecutionAgent...")
     agent = CodeExecutionAgent(
         mcp_tools=tools,
         tool_context=tool_context,
+        sandbox_runner=sandbox_runner,
+        tool_bridge=bridge,
     )
 
-    # 4. Run a Task
+    # 5. Run a Task
     # We'll ask for something that uses the filesystem tool if available,
     # or just a simple calculation if not.
     task = "Create a file named 'hello_mcp.txt' in /tmp with the content 'Hello from Phase 3 Agent!'"
     
     print(f"\n🚀 Running task: {task}")
     try:
-        result = await agent.run(task)
-        
+        result = await agent.run(task, timeout=120)
+
         print("\n" + "="*60)
         print("RESULT")
         print("="*60)
@@ -117,11 +131,8 @@ async def main():
 
         # Verify if file was created (if execution succeeded)
         # Note: This check runs in the HOST environment.
-        # If the sandbox is isolated (Deno), this file might not exist on the host
-        # unless we mapped /tmp. The default executor options in agent.py
-        # map /tmp, so it MIGHT work if Deno respects it.
         if os.path.exists("/tmp/hello_mcp.txt"):
-            with open("/tmp/hello_mcp.txt", "r") as f:
+            with open("/tmp/hello_mcp.txt", "r", encoding="utf-8") as f:
                 content = f.read()
             print(f"\n✅ Verification: File found with content: {content}")
         else:
@@ -131,6 +142,10 @@ async def main():
         print(f"\n❌ Agent failed: {e}")
         import traceback
         traceback.print_exc()
+    finally:
+        if bridge is not None:
+            await bridge.stop()
+        await manager.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())

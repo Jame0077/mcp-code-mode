@@ -20,7 +20,9 @@ LOGGER = logging.getLogger(__name__)
 try:
     import dspy
     from mcp_code_mode.agent import CodeExecutionAgent
+    from mcp_code_mode.executor import LocalPythonExecutor
     from mcp_code_mode.tool_formatter import ToolSchemaFormatter
+    from mcp_code_mode.tool_bridge import MCPToolBridge
 except ImportError as e:
     LOGGER.error("Failed to import dependencies: %s", e)
     sys.exit(1)
@@ -68,71 +70,73 @@ async def validate_agent():
     )
     
     tools = [read_file_tool, write_file_tool]
-    
+
     # 2. Format Tools for LLM
     LOGGER.info("Step 2: Formatting tools for LLM...")
     formatter = ToolSchemaFormatter(tools)
     tool_context = formatter.format_for_llm()
     LOGGER.info("Tool Context Preview:\n%s", tool_context[:200] + "...")
 
-    # 3. Initialize Agent
+    # 3. Initialize DSpy + Agent dependencies
     LOGGER.info("Step 3: Initializing CodeExecutionAgent...")
-    # Configure DSpy with a dummy LM if needed, or assume environment is set up
-    # For this validation to work, we need a real LM or a mock LM.
-    # We'll try to use a real one if configured, otherwise we might need to mock dspy.
-    
-    # NOTE: In a real run, dspy.configure() must be called before this.
-    # We assume the user has their environment set up for DSpy (e.g. OPENAI_API_KEY).
-    # If not, this will fail, which is part of validation.
-    
-    try:
-        # Check if LM is configured
-        if not dspy.settings.lm:
-             LOGGER.warning("No DSpy LM configured. Attempting to configure default...")
-             # This might fail if no keys are present
-             try:
-                 lm = dspy.LM("openai/gpt-4o-mini")
-                 dspy.configure(lm=lm)
-             except Exception as e:
-                 LOGGER.error("Failed to configure default LM: %s", e)
-                 LOGGER.error("Please ensure OPENAI_API_KEY is set or configure DSpy manually.")
-                 return
 
+    try:
+        if not dspy.settings.lm:
+            LOGGER.warning("No DSpy LM configured. Attempting to configure default...")
+            lm = dspy.LM("openai/gpt-4o-mini")
+            dspy.configure(lm=lm)
+    except Exception as e:
+        LOGGER.error("Failed to configure default LM: %s", e)
+        LOGGER.error("Please ensure OPENAI_API_KEY is set or configure DSpy manually.")
+        return
+
+    executor = LocalPythonExecutor()
+    bridge = MCPToolBridge(tools)
+    await bridge.start()
+
+    async def sandbox_runner(code, timeout=30, ctx=None, variables=None):
+        return await executor.run(code, timeout=timeout, variables=variables)
+
+    try:
         agent = CodeExecutionAgent(
             mcp_tools=tools,
-            tool_context=tool_context
+            tool_context=tool_context,
+            sandbox_runner=sandbox_runner,
+            tool_bridge=bridge,
         )
-        
     except Exception as e:
+        await bridge.stop()
         LOGGER.error("Failed to initialize agent: %s", e)
         return
 
     # 4. Run Agent with a Task
     task = "Read the file at /tmp/test.txt and print its content."
     LOGGER.info("Step 4: Running agent with task: '%s'", task)
-    
+
     try:
         result = await agent.run(task)
-        
+
         LOGGER.info("Validation Result:")
         LOGGER.info("  Success: %s", result["execution_result"]["success"])
         LOGGER.info("  Generated Code:\n%s", result["generated_code"])
-        
+
         # 5. Verify Output
         if "read_file" in result["generated_code"]:
             LOGGER.info("✅ PASS: Generated code uses 'read_file'")
         else:
             LOGGER.error("❌ FAIL: Generated code does NOT use 'read_file'")
-            
+
         if result["execution_result"]["success"]:
-             LOGGER.info("✅ PASS: Execution simulation successful")
+            LOGGER.info("✅ PASS: Execution simulation successful")
         else:
-             LOGGER.error("❌ FAIL: Execution simulation failed")
+            LOGGER.error("❌ FAIL: Execution simulation failed")
 
     except Exception as e:
         LOGGER.error("Agent run failed: %s", e)
         import traceback
         traceback.print_exc()
+    finally:
+        await bridge.stop()
 
 
 if __name__ == "__main__":
