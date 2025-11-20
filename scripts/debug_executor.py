@@ -63,7 +63,7 @@ async def main():
             
             # Define the task
             if tool_name == "run_agent":
-                args = {"task": "Calculate the 10th Fibonacci number and print it."}
+                args = {"task": "Generate 10 names and save into the memory"}
             else:
                 # execute_code
                 args = {"code": "print('Hello from direct execution!')"}

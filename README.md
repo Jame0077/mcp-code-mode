@@ -15,7 +15,30 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
 pip install -e .
+
+# Copy secrets template and fill it in locally (never commit real keys)
+cp .env.example .env
 ```
+
+After installing dependencies and adding your API keys to `.env`, sanity-check the
+DSpy sandbox before running the server:
+
+```bash
+python scripts/test_dspy_sandbox.py
+```
+
+### Sandbox guardrails
+
+All snippets (including agent-generated code) pass through policy checks before
+hitting the DSpy sandbox. These guardrails currently enforce:
+
+- ✅ Character/line limits (8k chars / 400 lines) to prevent runaway payloads
+- ✅ Import allowlist (`json`, `math`, `re`, `datetime`, etc.)
+- ✅ Disallowed token scan (e.g., `subprocess`, `socket`, `open(`, `eval`, `exec`,
+  `while True`)
+
+Violations return a structured `POLICY_VIOLATION` with a human-readable reason so
+MCP clients can surface clear diagnostics to the end user.
 
 To keep the Node-based MCP servers current, run:
 

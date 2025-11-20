@@ -1,0 +1,1 @@
+- To use python, please activate the venv with `source .venv/bin/activate`

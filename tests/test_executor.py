@@ -22,12 +22,18 @@ class StubInterpreter:
         self.stderr = stderr
         self.delay = delay
         self.exc = exc
+        self.variables: dict[str, Any] | None = None
 
-    def execute(self, code: str) -> dict[str, Any]:
+    def execute(
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if self.delay:
             time.sleep(self.delay)
         if self.exc is not None:
             raise self.exc
+        self.variables = variables
         return {"stdout": self.stdout or code, "stderr": self.stderr}
 
 
@@ -70,6 +76,17 @@ async def test_executor_exception_result() -> None:
 
 
 @pytest.mark.asyncio
+async def test_executor_forwards_variables() -> None:
+    interpreter = StubInterpreter(stdout="")
+    executor = SandboxedPythonExecutor(interpreter_factory=lambda: interpreter)
+
+    variables = {"foo": "bar"}
+    await executor.run("print('hi')", variables=variables)
+
+    assert interpreter.variables == variables
+
+
+@pytest.mark.asyncio
 async def test_execute_code_invalid_timeout(monkeypatch) -> None:
     # No executor patch needed; timeout validation happens before execution.
     # We call the underlying function (.fn) because the tool wrapper is not directly callable
@@ -83,10 +100,16 @@ async def test_execute_code_invalid_timeout(monkeypatch) -> None:
 async def test_execute_code_success(monkeypatch) -> None:
     class RecordingExecutor:
         def __init__(self) -> None:
-            self.calls: list[tuple[str, float]] = []
+            self.calls: list[tuple[str, float, dict[str, Any] | None]] = []
 
-        async def run(self, code: str, *, timeout: float) -> dict[str, Any]:
-            self.calls.append((code, timeout))
+        async def run(
+            self,
+            code: str,
+            *,
+            timeout: float,
+            variables: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            self.calls.append((code, timeout, variables))
             return {
                 "success": True,
                 "stdout": "ok",
@@ -99,7 +122,20 @@ async def test_execute_code_success(monkeypatch) -> None:
     monkeypatch.setattr(executor_server, "EXECUTOR", fake_executor)
 
     # Call the underlying function
-    result = await executor_server.execute_code.fn("print('ok')", timeout=5)
+    payload = {"foo": 1}
+    result = await executor_server.execute_code.fn(
+        "print('ok')",
+        timeout=5,
+        variables=payload,
+    )
 
     assert result["success"] is True
-    assert fake_executor.calls == [("print('ok')", 5.0)]
+    assert fake_executor.calls == [("print('ok')", 5.0, payload)]
+
+
+@pytest.mark.asyncio
+async def test_execute_code_policy_violation() -> None:
+    result = await executor_server.execute_code.fn("import subprocess\nprint('hi')")
+
+    assert result["success"] is False
+    assert result["diagnostics"]["error_type"] == "POLICY_VIOLATION"

@@ -12,7 +12,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Callable, Dict, Optional, Sequence, TypedDict
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, TypedDict
 
 try:  # Import guard so unit tests can stub the interpreter if DSpy is missing.
     from dspy.primitives.python_interpreter import (
@@ -108,6 +108,7 @@ class SandboxedPythonExecutor:
         code: str,
         *,
         timeout: float = 30,
+        variables: Mapping[str, Any] | None = None,
     ) -> ExecutionResult:
         """Execute `code` with a timeout and normalized result payload."""
 
@@ -117,7 +118,7 @@ class SandboxedPythonExecutor:
         started = time.perf_counter()
         try:
             raw = await asyncio.wait_for(
-                asyncio.to_thread(self._execute_sync, code),
+                asyncio.to_thread(self._execute_sync, code, variables),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
@@ -137,12 +138,16 @@ class SandboxedPythonExecutor:
             diagnostics=None,
         )
 
-    def _execute_sync(self, code: str) -> Any:
+    def _execute_sync(
+        self,
+        code: str,
+        variables: Mapping[str, Any] | None,
+    ) -> Any:
         """Invoke the underlying interpreter in a thread-safe manner."""
 
         with self._lock:
             interpreter = self._ensure_interpreter()
-            return interpreter.execute(code)
+            return interpreter.execute(code, variables=variables)
 
     def _normalize_output(self, raw: Any) -> tuple[str, str]:
         """Extract stdout/stderr pairs from interpreter responses."""

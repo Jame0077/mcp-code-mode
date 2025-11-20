@@ -1,321 +1,347 @@
-"""DSpy agent for generating and executing code using MCP tools."""
+"""DSpy agent that directly orchestrates MCP tools (no HTTP bridge required)."""
 from __future__ import annotations
 
 import asyncio
-import logging
+import contextlib
+import io
 import json
-from typing import Any, Dict, List, Optional, Sequence
+import keyword
+import logging
+import re
+from typing import Any, Awaitable, Callable, Dict, Mapping, Sequence
 
 try:
     import dspy
-except ImportError:
+except ImportError:  # pragma: no cover - enforced during runtime
     dspy = None  # type: ignore
-
-try:
-    from aiohttp import web
-except ImportError:
-    web = None
 
 LOGGER = logging.getLogger(__name__)
 
+from .executor import ExecutionResult
+from .tool_bridge import MCPToolBridge, ToolBridgeSession
 
-class CodeGenerationSignature(dspy.Signature):
-    """Generate Python code to complete a task using available MCP tools."""
+SandboxRunner = Callable[
+    [str, float, Any | None, Mapping[str, Any] | None],
+    Awaitable[ExecutionResult],
+]
 
-    task: str = dspy.InputField(desc="The user's task to complete")
+_TOOL_BRIDGE_TEMPLATE = """
+import json
+import urllib.error
+import urllib.request
+
+_MCP_INTERNAL_ENDPOINT = {endpoint!r}
+_MCP_INTERNAL_TOKEN = {token!r}
+_MCP_REQUEST_TIMEOUT = {timeout}
+
+def _mcp_bridge_request(name, params):
+    payload = json.dumps({{
+        "token": _MCP_INTERNAL_TOKEN,
+        "name": name,
+        "params": params,
+    }}).encode("utf-8")
+    request = urllib.request.Request(
+        _MCP_INTERNAL_ENDPOINT,
+        data=payload,
+        headers={{"Content-Type": "application/json"}},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_MCP_REQUEST_TIMEOUT) as response:
+            raw = response.read().decode("utf-8") or "{{}}"
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"MCP tool bridge network error: {{exc}}") from exc
+    data = json.loads(raw)
+    if not data.get("success"):
+        raise RuntimeError(data.get("error", "MCP tool call failed"))
+    return data.get("result")
+
+def call_mcp_tool(name: str, **params):
+    return _mcp_bridge_request(name, params)
+
+def list_mcp_tools():
+    return {tools_json}
+
+def _bind_mcp_tool(name: str):
+    def _caller(**params):
+        return call_mcp_tool(name, **params)
+    return _caller
+
+AVAILABLE_MCP_TOOLS = {{}}
+{alias_lines}
+""".strip()
+
+
+class CodeGenerationSignature(dspy.Signature):  # type: ignore[misc]
+    """Ask DSpy to reason about a task and call MCP tools directly."""
+
+    task: str = dspy.InputField(desc="The end-user request or problem statement.")
     available_tools: str = dspy.InputField(
-        desc="Detailed documentation of available MCP tools with parameters and examples"
+        desc="LLM-readable documentation for the currently connected MCP tools."
     )
     code: dspy.Code = dspy.OutputField(
-        desc="Python code that uses the available tools to complete the task. The code MUST print the final answer/result to stdout."
+        desc="Python helper code that DSpy executed internally while solving the task."
     )
-
-
-class _ToolBridge:
-    """Temporary HTTP server to bridge sandbox calls to MCP tools."""
-
-    def __init__(self, tools_map: Dict[str, Any]) -> None:
-        self.tools_map = tools_map
-        self.runner: Optional[web.AppRunner] = None
-        self.site: Optional[web.TCPSite] = None
-        self.port: Optional[int] = None
-
-    async def handle_request(self, request: web.Request) -> web.Response:
-        try:
-            data = await request.json()
-            name = data.get("name")
-            kwargs = data.get("args", {})
-
-            if name not in self.tools_map:
-                return web.json_response(
-                    {"error": f"Tool {name} not found"}, status=404
-                )
-
-            tool = self.tools_map[name]
-            # Handle both sync and async tool wrappers
-            # dspy.Tool wrappers might be callable directly
-            result = tool(**kwargs)
-            if asyncio.iscoroutine(result):
-                result = await result
-
-            return web.json_response({"result": result})
-        except Exception as e:
-            LOGGER.exception(f"Tool bridge error for {name}")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def start(self) -> str:
-        if web is None:
-            raise RuntimeError("aiohttp is required for tool bridge")
-
-        app = web.Application()
-        app.router.add_post("/tool", self.handle_request)
-        self.runner = web.AppRunner(app)
-        await self.runner.setup()
-        self.site = web.TCPSite(self.runner, "localhost", 0)
-        await self.site.start()
-        
-        # Get the assigned port
-        # Accessing socket directly to get the ephemeral port
-        if self.site is None:
-            raise RuntimeError("Server site not initialized")
-        server = self.site._server
-        if server is None:
-            raise RuntimeError("Server not started")
-        
-        # aiohttp internal API access
-        socket = server.sockets[0] # type: ignore
-        self.port = socket.getsockname()[1]
-        return f"http://localhost:{self.port}/tool"
-
-    async def stop(self) -> None:
-        if self.site:
-            await self.site.stop()
-        if self.runner:
-            await self.runner.cleanup()
+    answer: str = dspy.OutputField(
+        desc="Final response to return to the user after calling tools."
+    )
 
 
 class CodeExecutionAgent:
-    """Agent that generates and executes Python code using MCP tools."""
+    """High-level agent that delegates orchestration to DSpy's CodeAct."""
 
     def __init__(
         self,
         mcp_tools: Sequence[Any],
         tool_context: str,
+        sandbox_runner: SandboxRunner,
+        tool_bridge: MCPToolBridge,
         max_iters: int = 3,
     ) -> None:
-        """Initialize agent with discovered MCP tools.
-
-        Args:
-            mcp_tools: List of DSpy-wrapped MCP tools.
-            tool_context: Formatted tool documentation for the LLM.
-            max_iters: Maximum number of retry iterations for code generation.
-        """
-        if dspy is None:
+        if dspy is None:  # pragma: no cover - runtime guard
             raise RuntimeError("dspy-ai is not installed")
 
         self.mcp_tools = list(mcp_tools)
-        self.tool_context = tool_context
-        # Create a map for easier lookup by name
+        self._tool_bridge = tool_bridge
         self.tool_names = [getattr(t, "name", str(t)) for t in self.mcp_tools]
-        self.tools_map = {name: tool for name, tool in zip(self.tool_names, self.mcp_tools)}
+        self._sandbox_runner = sandbox_runner
+        self._tool_specs = self._build_tool_specs()
+        self.tool_context = self._augment_tool_context(tool_context)
+        self._sandbox_variables = self._build_sandbox_variables()
 
-        # Create code generator with tool-aware signature
-        self.generator = dspy.ProgramOfThought(
-            CodeGenerationSignature,
-            max_iters=max_iters,
-        )
+        generator_cls = getattr(dspy, "CodeAct", dspy.ProgramOfThought)
+        try:
+            self.generator = generator_cls(
+                CodeGenerationSignature,
+                tools=self.mcp_tools,
+                max_iters=max_iters,
+            )
+        except (TypeError, ValueError):
+            # Fallback for older CodeAct implementations that don't accept tools.
+            self.generator = dspy.ProgramOfThought(
+                CodeGenerationSignature,
+                max_iters=max_iters,
+            )
 
     async def run(self, task: str, timeout: int = 120, ctx: Any = None) -> Dict[str, Any]:
-        """Generate and execute code for a task.
+        """Execute the end-to-end tool reasoning flow inside DSpy."""
 
-        Args:
-            task: The user's natural language request.
-            timeout: Execution timeout in seconds.
-            ctx: Optional FastMCP Context for progress reporting.
-
-        Returns:
-            A dictionary containing the task, generated code, and execution result.
-        """
         LOGGER.info("Running agent for task: %s", task)
         LOGGER.debug("Available tools: %s", self.tool_names)
 
-        # Generate code
-        # Run the synchronous dspy generator in a separate thread to avoid blocking the event loop
-        # We also capture stdout to prevent dspy from printing to the real stdout (which would break MCP)
-        import io
-        import contextlib
-        import time
-        
-        def _run_generator_safely():
-            f = io.StringIO()
-            with contextlib.redirect_stdout(f):
-                start = time.time()
-                try:
-                    # Ensure dspy doesn't try to use the main thread loop if it does any async stuff internally
-                    # (Though ProgramOfThought is mostly sync in current dspy versions)
-                    res = self.generator(
-                        task=task,
-                        available_tools=self.tool_context,
-                    )
-                    return res, f.getvalue(), time.time() - start
-                except Exception:
-                    # If it fails, we still want the stdout
-                    raise
-
-        # Start a progress ticker to keep the client connection alive and informed
         stop_ticker = asyncio.Event()
-        
-        async def progress_ticker():
+
+        async def _ticker() -> None:
             seconds = 0
             while not stop_ticker.is_set():
                 await asyncio.sleep(1)
                 seconds += 1
                 if ctx:
                     try:
-                         await ctx.info(f"Agent thinking... ({seconds}s)")
-                         # Toggle progress to show activity
-                         await ctx.report_progress(seconds % 10, 10)
-                    except Exception:
-                         # Ignore errors if ctx is closed
-                         pass
-                
-                if seconds % 2 == 0:
-                     LOGGER.info(f"Agent generation still in progress... ({seconds}s)")
+                        await ctx.info(f"Agent reasoning... ({seconds}s)")
+                        await ctx.report_progress(seconds % 10, 10)
+                    except Exception:  # pragma: no cover - ctx not always available
+                        pass
 
-        ticker_task = asyncio.create_task(progress_ticker())
+        ticker_task = asyncio.create_task(_ticker())
 
         try:
-            result, captured_stdout, duration = await asyncio.to_thread(_run_generator_safely)
-            LOGGER.info("DSpy generation took %.2f seconds", duration)
+            result, captured_stdout, duration = await asyncio.to_thread(
+                self._invoke_generator, task
+            )
             if captured_stdout:
-                LOGGER.warning("DSpy wrote to stdout (captured): %s", captured_stdout)
-        except Exception as e:
-            LOGGER.exception("DSpy generation failed")
-            raise e
+                LOGGER.debug("Captured DSpy stdout: %s", captured_stdout)
         finally:
             stop_ticker.set()
-            try:
+            with contextlib.suppress(Exception):
                 await ticker_task
-            except Exception:
-                pass
 
-        generated_code = str(result.code)
-        LOGGER.info("Generated code:\n%s", generated_code)
+        generated_code = str(getattr(result, "code", ""))
+        final_answer = str(getattr(result, "answer", "") or getattr(result, "text", ""))
 
-        # Execute code with access to MCP tools
-        execution_result = await self._execute_with_tools(generated_code, timeout=timeout)
+        sandbox_result = await self._run_sandbox_execution(
+            code=generated_code,
+            timeout=timeout,
+            ctx=ctx,
+        )
+        if final_answer:
+            diagnostics = sandbox_result.get("diagnostics") or {}
+            diagnostics["llm_answer"] = final_answer
+            sandbox_result["diagnostics"] = diagnostics
 
         return {
             "task": task,
             "generated_code": generated_code,
-            "execution_result": execution_result,
+            "execution_result": sandbox_result,
         }
 
-    def _generate_tool_shims(self, bridge_url: str) -> str:
-        """Generate Python shims that call back to the host via HTTP.
+    def _invoke_generator(self, task: str):
+        """Call the (synchronous) DSpy generator with stdout redirection."""
 
-        This generates a set of functions that match the discovered tools,
-        but implemented as HTTP calls to the ephemeral bridge server.
-        """
-        shims = [
-            "import urllib.request",
-            "import json",
-            "import os",
-            "",
-            f'BRIDGE_URL = "{bridge_url}"',
-            "",
-            "def _call_tool(name, args):",
-            "    '''Internal helper to call MCP tools via bridge.'''",
-            "    try:",
-            "        data = json.dumps({'name': name, 'args': args}).encode('utf-8')",
-            "        req = urllib.request.Request(",
-            "            BRIDGE_URL, ",
-            "            data=data, ",
-            "            headers={'Content-Type': 'application/json'}",
-            "        )",
-            "        with urllib.request.urlopen(req) as response:",
-            "            if response.status >= 400:",
-            "                return f'Error calling tool {name}: {response.status} {response.reason}'",
-            "            result_data = json.loads(response.read().decode('utf-8'))",
-            "            if 'error' in result_data:",
-            "                return f'Error: {result_data[\"error\"]}'",
-            "            return result_data['result']",
-            "    except Exception as e:",
-            "        return f'Error invoking tool {name}: {e}'",
-            ""
-        ]
+        import time
 
-        # Generate a shim function for each available tool
-        for tool_name in self.tool_names:
-            shims.append(f"def {tool_name}(**kwargs):")
-            shims.append(f'    """Call the {tool_name} tool."""')
-            shims.append(f'    return _call_tool("{tool_name}", kwargs)')
-            shims.append("")
+        buffer = io.StringIO()
+        start = time.perf_counter()
 
-        return "\n".join(shims)
-
-    async def _execute_with_tools(self, code: str, timeout: int = 120) -> Dict[str, Any]:
-        """Execute generated code with MCP tools available."""
-        # Validate code first
-        is_valid, message = self.validate_code(code)
-        if not is_valid:
-            return {
-                "success": False,
-                "stdout": "",
-                "stderr": f"Validation failed: {message}",
-                "duration_ms": 0,
-            }
-
-        from .executor import SandboxedPythonExecutor, SandboxOptions
-
-        # Start the tool bridge
-        bridge = _ToolBridge(self.tools_map)
-        bridge_url = ""
-        try:
-            bridge_url = await bridge.start()
-            LOGGER.info(f"Tool bridge started at {bridge_url}")
-
-            # Inject tool shims pointing to the bridge
-            tool_header = self._generate_tool_shims(bridge_url)
-            full_code = f"{tool_header}\n\n# Generated Code\n{code}"
-
-            options = SandboxOptions(
-                enable_network_access=True,  # Required for bridge
-                enable_env_vars=True,
-                # Mount /tmp for file tools if they still want local access
-                # Note: We cannot mount directories in dspy, so we leave this empty.
-                # The sandbox has its own ephemeral /tmp.
-                enable_read_paths=[],
-                enable_write_paths=[],
+        with contextlib.redirect_stdout(buffer):
+            result = self.generator(
+                task=task,
+                available_tools=self.tool_context,
             )
-            executor = SandboxedPythonExecutor(options=options)
 
-            # Execute
-            result = await executor.run(full_code, timeout=timeout)
-            return result
-            
-        except Exception as e:
-            LOGGER.exception("Execution failed")
-            return {
-                "success": False,
-                "stdout": "",
-                "stderr": f"Execution error: {str(e)}",
-                "duration_ms": 0,
-            }
+        elapsed = time.perf_counter() - start
+
+        return result, buffer.getvalue(), elapsed
+
+    async def _run_sandbox_execution(
+        self,
+        *,
+        code: str,
+        timeout: int,
+        ctx: Any | None,
+    ) -> ExecutionResult:
+        session: ToolBridgeSession | None = None
+        try:
+            session = await self._tool_bridge.create_session(timeout=timeout)
+            execution_code = self._prepare_execution_code(code, session, timeout)
+            return await self._sandbox_runner(
+                execution_code,
+                timeout=timeout,
+                ctx=ctx,
+                variables=self._sandbox_variables,
+            )
+        except Exception as exc:  # pragma: no cover - fallback for diagnostics
+            LOGGER.exception("Sandbox execution failed")
+            return ExecutionResult(
+                success=False,
+                stdout="",
+                stderr=str(exc),
+                duration_ms=0,
+                diagnostics={"error_type": exc.__class__.__name__},
+            )
         finally:
-            await bridge.stop()
+            if session is not None:
+                self._tool_bridge.invalidate_session(session["token"])
 
-    def validate_code(self, code: str) -> tuple[bool, str]:
-        """Validate generated code before execution."""
-        # Check if code uses any available tools
-        uses_tools = any(name in code for name in self.tool_names)
-        has_output = "print" in code
+    def _build_sandbox_variables(self) -> Dict[str, Any]:
+        return {
+            "MCP_TOOL_CONTEXT": self.tool_context,
+            "MCP_TOOL_NAMES": self.tool_names,
+            "MCP_TOOLS": self._tool_specs,
+        }
 
-        if not uses_tools:
-            # We allow execution even without tools, but warn
-            pass
-            
-        if not has_output:
-            return False, "Code does not print any output"
+    def _build_tool_specs(self) -> list[Dict[str, Any]]:
+        aliases_in_use: set[str] = set()
+        specs: list[Dict[str, Any]] = []
+        for tool in self.mcp_tools:
+            spec = self._tool_spec(tool)
+            alias = self._generate_alias(spec["name"], aliases_in_use)
+            spec["alias"] = alias
+            specs.append(spec)
+        return specs
 
-        return True, "Code validation passed"
+    def _tool_spec(self, tool: Any) -> Dict[str, Any]:
+        schema = getattr(tool, "input_schema", None) or {}
+        return {
+            "name": getattr(tool, "name", "unknown_tool"),
+            "description": self._normalize_description(getattr(tool, "description", "")),
+            "schema": self._sanitize_schema(schema),
+        }
+
+    def _augment_tool_context(self, base: str) -> str:
+        alias_lines = [
+            f"- `{spec['alias']}(**kwargs)` maps to `{spec['name']}`"
+            for spec in self._tool_specs
+            if spec.get("alias")
+        ]
+        helper_sections = [
+            "## MCP Tool Execution Helpers",
+            "Use `call_mcp_tool(tool_name, **params)` to invoke MCP tools inside the sandbox.",
+        ]
+        if alias_lines:
+            helper_sections.append("")
+            helper_sections.append("### Shortcut Functions")
+            helper_sections.extend(alias_lines)
+        return f"{base}\n\n" + "\n".join(helper_sections)
+
+    def _prepare_execution_code(
+        self,
+        code: str,
+        session: ToolBridgeSession,
+        timeout: int,
+    ) -> str:
+        prelude = self._build_bridge_prelude(session, timeout)
+
+        # Some LLM runs return code wrapped in a string variable (e.g., `code = "def foo(): ..."`).
+        # To make those runs still execute, add a small postlude that will exec stringified code if present.
+        postlude = (
+            "\n\n# Auto-execute stringified code if the model wrapped it in `code`\n"
+            "if 'code' in locals() and isinstance(code, str):\n"
+            "    exec(code, globals(), locals())\n"
+        )
+
+        return f"{prelude}\n\n{code}{postlude}"
+
+    def _build_bridge_prelude(
+        self,
+        session: ToolBridgeSession,
+        timeout: int,
+    ) -> str:
+        alias_lines = self._alias_registration_lines()
+        tools_json = json.dumps(
+            [
+                {
+                    "name": spec["name"],
+                    "description": spec.get("description", ""),
+                    "schema": spec.get("schema", {}),
+                    "alias": spec.get("alias"),
+                }
+                for spec in self._tool_specs
+            ]
+        )
+        return _TOOL_BRIDGE_TEMPLATE.format(
+            endpoint=session["endpoint"],
+            token=session["token"],
+            timeout=max(5, timeout),
+            tools_json=tools_json,
+            alias_lines=alias_lines,
+        )
+
+    def _alias_registration_lines(self) -> str:
+        lines: list[str] = []
+        for spec in self._tool_specs:
+            name = spec["name"]
+            lines.append(f"AVAILABLE_MCP_TOOLS[{name!r}] = _bind_mcp_tool({name!r})")
+            alias = spec.get("alias")
+            if alias:
+                lines.append(f"{alias} = AVAILABLE_MCP_TOOLS[{name!r}]  # alias for {name}")
+        return "\n".join(lines)
+
+    def _normalize_description(self, description: Any) -> str:
+        if callable(description):
+            try:
+                description = description()
+            except Exception:
+                description = ""
+        if isinstance(description, str):
+            return description.strip()
+        return ""
+
+    def _sanitize_schema(self, schema: Any) -> Any:
+        if not schema:
+            return {}
+        try:
+            return json.loads(json.dumps(schema))
+        except (TypeError, ValueError):
+            return {}
+
+    def _generate_alias(self, name: str, used: set[str]) -> str | None:
+        candidate = re.sub(r"[^0-9a-zA-Z_]", "_", name)
+        if not candidate:
+            return None
+        if candidate[0].isdigit():
+            candidate = f"tool_{candidate}"
+        candidate = candidate.lower()
+        while candidate in used or keyword.iskeyword(candidate):
+            candidate = f"{candidate}_tool"
+        used.add(candidate)
+        return candidate

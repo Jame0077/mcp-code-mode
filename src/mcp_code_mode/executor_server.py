@@ -5,15 +5,18 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
-from typing import Any, Dict, AsyncIterator
+from typing import Any, Dict, Mapping, AsyncIterator
 
 import dspy
 from fastmcp import Context, FastMCP
 
 from .agent import CodeExecutionAgent
-from .executor import ExecutionResult, SandboxOptions, SandboxedPythonExecutor
+from .executor import ExecutionResult, SandboxedPythonExecutor
 from .mcp_integration import setup_mcp_tools
 from .mcp_manager import MCPServerManager
+from .sandbox_config import DEFAULT_SANDBOX_OPTIONS
+from .policies import enforce_guardrails
+from .tool_bridge import MCPToolBridge
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -25,6 +28,7 @@ SERVER_STATE: Dict[str, Any] = {
     "manager": None,
     "mcp_tools": [],
     "tool_context": "",
+    "tool_bridge": None,
 }
 
 
@@ -59,6 +63,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[None]:
 
     # 2. Connect to upstream MCP servers
     manager = MCPServerManager()
+    bridge: MCPToolBridge | None = None
     try:
         # This discovers tools from mcp_servers.json
         setup = await setup_mcp_tools(manager)
@@ -66,6 +71,9 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[None]:
         SERVER_STATE["manager"] = setup["manager"]
         SERVER_STATE["mcp_tools"] = setup["tools"]
         SERVER_STATE["tool_context"] = setup["llm_context"]
+        bridge = MCPToolBridge(setup["tools"])
+        await bridge.start()
+        SERVER_STATE["tool_bridge"] = bridge
         
         LOGGER.info(f"Discovered {len(SERVER_STATE['mcp_tools'])} tools")
         
@@ -74,6 +82,8 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[None]:
     finally:
         LOGGER.info("Shutting down Agent Server...")
         await manager.shutdown()
+        if bridge is not None:
+            await bridge.stop()
         SERVER_STATE.clear()
 
 
@@ -83,15 +93,7 @@ mcp = FastMCP("Code Executor Agent", lifespan=server_lifespan)
 # --- Phase 1: Dumb Executor (Kept for reference/direct use) ---
 
 # Default sandbox for direct execution (safe defaults)
-EXECUTOR = SandboxedPythonExecutor(
-    options=SandboxOptions(
-        enable_network_access=False,
-        enable_env_vars=False,
-        enable_read_paths=(),
-        enable_write_paths=(),
-        max_output_chars=64_000,
-    )
-)
+EXECUTOR = SandboxedPythonExecutor(options=DEFAULT_SANDBOX_OPTIONS)
 
 DEFAULT_TIMEOUT = 30
 
@@ -100,6 +102,7 @@ async def execute_code(
     code: str,
     timeout: int = DEFAULT_TIMEOUT,
     ctx: Context | None = None,
+    variables: Mapping[str, Any] | None = None,
 ) -> ExecutionResult:
     """Execute Python code inside DSpy's sandboxed interpreter.
     
@@ -118,12 +121,26 @@ async def execute_code(
             diagnostics={"error_type": "INVALID_ARGUMENT"},
         )
 
+    allowed, violation = enforce_guardrails(code)
+    if not allowed:
+        return ExecutionResult(
+            success=False,
+            stdout="",
+            stderr=violation or "Policy violation",
+            duration_ms=0,
+            diagnostics={"error_type": "POLICY_VIOLATION"},
+        )
+
     if ctx is not None:
         await ctx.info(
             f"Executing snippet ({len(code)} chars, timeout={numeric_timeout}s)"
         )
 
-    result = await EXECUTOR.run(code, timeout=numeric_timeout)
+    result = await EXECUTOR.run(
+        code,
+        timeout=numeric_timeout,
+        variables=variables,
+    )
 
     if ctx is not None and not result.get("success", False):
         diagnostics = result.get("diagnostics") or {}
@@ -155,6 +172,8 @@ async def run_agent(
     """
     if not SERVER_STATE.get("mcp_tools"):
         return "Error: No tools available. Is the server initialized?"
+    if SERVER_STATE.get("tool_bridge") is None:
+        return "Error: Tool bridge unavailable"
 
     if ctx:
         await ctx.info(f"Agent received task: {task}")
@@ -165,6 +184,8 @@ async def run_agent(
         agent = CodeExecutionAgent(
             mcp_tools=SERVER_STATE["mcp_tools"],
             tool_context=SERVER_STATE["tool_context"],
+            sandbox_runner=execute_code.fn,
+            tool_bridge=SERVER_STATE["tool_bridge"],
         )
 
         # Run the agent
